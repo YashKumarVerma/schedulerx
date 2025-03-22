@@ -14,6 +14,7 @@ type Config struct {
 	CacheUsername   string `env:"CACHE_USERNAME" envDefault:""`
 	CacheTLSDomain  string `env:"CACHE_TLS_DOMAIN" envDefault:""`
 	PodID           string `env:"POD_ID" envDefault:""`
+	NextJobCount    int    `env:"NEXT_JOB_COUNT" envDefault:"3"`
 }
 
 var appConfig *Config

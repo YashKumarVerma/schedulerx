@@ -13,6 +13,11 @@ type Client struct {
 	client *redis.Client
 }
 
+// GetClient returns the underlying Redis client
+func (c *Client) GetClient() *redis.Client {
+	return c.client
+}
+
 // Ping tests the Redis connection
 func (c *Client) Ping(ctx context.Context) error {
 	return c.client.Ping(ctx).Err()

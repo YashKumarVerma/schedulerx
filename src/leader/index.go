@@ -24,6 +24,7 @@ type PodInfo struct {
 	ID        string    `json:"id"`
 	StartTime time.Time `json:"start_time"`
 	LastSeen  time.Time `json:"last_seen"`
+	Status    string    `json:"status"`
 }
 
 var (
@@ -68,6 +69,7 @@ func (pm *PodManager) Initialize(ctx context.Context) error {
 		ID:        podID,
 		StartTime: time.Now(),
 		LastSeen:  time.Now(),
+		Status:    "active",
 	}
 
 	// Register pod in Redis
@@ -78,10 +80,11 @@ func (pm *PodManager) Initialize(ctx context.Context) error {
 	// Start presence update routine
 	go pm.startPresenceUpdates(ctx)
 
+	pm.logger.Info("Pod manager initialized", "pod_id", podID)
 	return nil
 }
 
-// registerPod adds the pod to the Redis registry
+// registerPod registers the pod in Redis
 func (pm *PodManager) registerPod(ctx context.Context) error {
 	if pm.info == nil {
 		return fmt.Errorf("pod info not initialized")
@@ -93,16 +96,16 @@ func (pm *PodManager) registerPod(ctx context.Context) error {
 		return fmt.Errorf("failed to get pods: %w", err)
 	}
 
-	// Ensure pods map is initialized
-	if pods == nil {
-		pods = make(map[string]*PodInfo)
+	// Add or update current pod
+	pods[pm.info.ID] = PodInfo{
+		ID:        pm.info.ID,
+		StartTime: pm.info.StartTime,
+		LastSeen:  pm.info.LastSeen,
+		Status:    pm.info.Status,
 	}
 
-	// Add or update current pod
-	pods[pm.info.ID] = pm.info
-
 	// Store updated pods
-	if err := pm.storePods(ctx, pods); err != nil {
+	if err := pm.client.SetJSONWithExpiry(ctx, podRegistryKey, pods, 24*time.Hour); err != nil {
 		return fmt.Errorf("failed to store pods: %w", err)
 	}
 
@@ -110,24 +113,20 @@ func (pm *PodManager) registerPod(ctx context.Context) error {
 }
 
 // getPods retrieves all registered pods from Redis
-func (pm *PodManager) getPods(ctx context.Context) (map[string]*PodInfo, error) {
-	pods := make(map[string]*PodInfo)
-	err := pm.client.GetJSON(ctx, podRegistryKey, &pods)
-	if err != nil {
-		// If key doesn't exist or other error, return empty map
-		return make(map[string]*PodInfo), nil
+func (pm *PodManager) getPods(ctx context.Context) (map[string]PodInfo, error) {
+	var pods map[string]PodInfo
+	if err := pm.client.GetJSON(ctx, podRegistryKey, &pods); err != nil {
+		return nil, fmt.Errorf("failed to get pods: %w", err)
+	}
+	if pods == nil {
+		return make(map[string]PodInfo), nil
 	}
 	return pods, nil
 }
 
-// storePods saves the pod registry to Redis
-func (pm *PodManager) storePods(ctx context.Context, pods map[string]*PodInfo) error {
-	return pm.client.SetJSON(ctx, podRegistryKey, pods)
-}
-
 // cleanupDeadPods removes pods that haven't been seen for longer than podTTL
-func (pm *PodManager) cleanupDeadPods(ctx context.Context, pods map[string]*PodInfo) map[string]*PodInfo {
-	cleanedPods := make(map[string]*PodInfo)
+func (pm *PodManager) cleanupDeadPods(ctx context.Context, pods map[string]PodInfo) map[string]PodInfo {
+	cleanedPods := make(map[string]PodInfo)
 	now := time.Now()
 
 	for id, info := range pods {
@@ -155,7 +154,7 @@ func (pm *PodManager) startPresenceUpdates(ctx context.Context) {
 			return
 		case <-ticker.C:
 			if err := pm.updatePresence(ctx); err != nil {
-				pm.logger.Error("Failed to update presence", err)
+				pm.logger.Error("Failed to update presence", "error", err)
 			}
 		}
 	}
@@ -179,10 +178,15 @@ func (pm *PodManager) updatePresence(ctx context.Context) error {
 	pods = pm.cleanupDeadPods(ctx, pods)
 
 	// Add or update current pod
-	pods[pm.info.ID] = pm.info
+	pods[pm.info.ID] = PodInfo{
+		ID:        pm.info.ID,
+		StartTime: pm.info.StartTime,
+		LastSeen:  pm.info.LastSeen,
+		Status:    pm.info.Status,
+	}
 
 	// Store updated pods
-	if err := pm.storePods(ctx, pods); err != nil {
+	if err := pm.registerPod(ctx); err != nil {
 		return err
 	}
 
@@ -292,4 +296,16 @@ func GetLeader() string {
 		return ""
 	}
 	return leaderID
+}
+
+// IsLeader checks if the current pod is the leader (global function)
+func IsLeader() bool {
+	if instance == nil {
+		return false
+	}
+	isLeader, err := instance.IsLeader(context.Background())
+	if err != nil {
+		return false
+	}
+	return isLeader
 }
