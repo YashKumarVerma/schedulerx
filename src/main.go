@@ -62,7 +62,6 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				fmt.Println("Scheduling jobs")
 				if err := scheduler.ScheduleJobs(ctx); err != nil {
 					logger.Error("Failed to schedule jobs", "error", err)
 				}

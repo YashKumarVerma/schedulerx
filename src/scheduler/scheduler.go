@@ -44,7 +44,6 @@ func (s *Scheduler) RegisterCommand(cmd command.Command) {
 // ScheduleJobs schedules the next batch of jobs
 func (s *Scheduler) ScheduleJobs(ctx context.Context) error {
 	if !leader.IsLeader() {
-		fmt.Println("Not the leader, skipping scheduling")
 		return nil
 	}
 
@@ -90,32 +89,40 @@ func (s *Scheduler) ScheduleJobs(ctx context.Context) error {
 		}
 	}
 
-	// Fetch and print top 10 upcoming jobs
-	fmt.Println("Fetching upcoming jobs")
-	jobs, err := s.redisClient.GetClient().ZRange(ctx, command.JobsSortedSetKey, 0, -1).Result()
-	fmt.Println("Total Job Count", len(jobs))
-	if err != nil {
-		s.logger.Error("Failed to fetch upcoming jobs", "error", err)
-		return nil
-	}
+	// Start job assignment routine
+	go func() {
+		ticker := time.NewTicker(30 * time.Second) // Reduced frequency to 30 seconds
+		defer ticker.Stop()
 
-	fmt.Println("\nTop 10 Upcoming Jobs:")
-	fmt.Println("--------------------")
-	for _, jobID := range jobs {
-		jobKey := fmt.Sprintf(command.JobDetailsKey, jobID)
-		jobData, err := s.redisClient.GetClient().Get(ctx, jobKey).Bytes()
-		if err != nil {
-			continue
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if !leader.IsLeader() {
+					continue
+				}
+
+				// Get all pods from Redis
+				var pods map[string]leader.PodInfo
+				if err := s.redisClient.GetJSON(ctx, "schedulerx:pods", &pods); err != nil {
+					s.logger.Error("Failed to get pods", "error", err)
+					continue
+				}
+
+				// Get all available pods (including the leader)
+				availablePods := make([]string, 0, len(pods))
+				for podID := range pods {
+					availablePods = append(availablePods, podID)
+				}
+
+				// Assign jobs to available pods
+				if err := s.AssignJobs(ctx, availablePods); err != nil {
+					s.logger.Error("Failed to assign jobs", "error", err)
+				}
+			}
 		}
-
-		var job command.Job
-		if err := json.Unmarshal(jobData, &job); err != nil {
-			continue
-		}
-
-		fmt.Printf("Job ID: %s\nCommand: %s\nScheduled: %s\nStatus: %s\nAssignedTo: %s\n--------------------\n",
-			job.ID, job.CommandID, job.ScheduledAt.Format(time.RFC3339), job.Status, job.AssignedTo)
-	}
+	}()
 
 	return nil
 }
@@ -151,36 +158,6 @@ func (s *Scheduler) getNextExecutionTimesInWindow(cmd command.Command, start, en
 	return nextTimes, nil
 }
 
-// Start begins the scheduler
-func (s *Scheduler) Start() error {
-	// TODO: Implement scheduler logic
-	return nil
-}
-
-// Stop gracefully stops the scheduler
-func (s *Scheduler) Stop() error {
-	// TODO: Implement graceful shutdown
-	return nil
-}
-
-// ScheduleTask schedules a task to run at a specific time
-func (s *Scheduler) ScheduleTask(taskID string, executionTime time.Time) error {
-	// TODO: Implement task scheduling
-	return nil
-}
-
-// CancelTask cancels a scheduled task
-func (s *Scheduler) CancelTask(taskID string) error {
-	// TODO: Implement task cancellation
-	return nil
-}
-
-// ListTasks returns all scheduled tasks
-func (s *Scheduler) ListTasks() ([]string, error) {
-	// TODO: Implement task listing
-	return nil, nil
-}
-
 // AssignJobs assigns unassigned jobs to available pods in a round-robin fashion
 func (s *Scheduler) AssignJobs(ctx context.Context, pods []string) error {
 	if len(pods) == 0 {
@@ -197,6 +174,12 @@ func (s *Scheduler) AssignJobs(ctx context.Context, pods []string) error {
 	jobs, err := s.redisClient.GetClient().ZRange(ctx, command.JobsSortedSetKey, 0, int64(jobCount)-1).Result()
 	if err != nil {
 		return fmt.Errorf("failed to fetch jobs: %w", err)
+	}
+
+	// Create a set of alive pods for quick lookup
+	alivePods := make(map[string]bool)
+	for _, podID := range pods {
+		alivePods[podID] = true
 	}
 
 	// Round-robin assignment
@@ -216,9 +199,24 @@ func (s *Scheduler) AssignJobs(ctx context.Context, pods []string) error {
 			continue
 		}
 
-		// Skip if job is already assigned or running
-		if job.AssignedTo != "" || job.Status == command.Running {
+		// Skip if job is running
+		if job.Status == command.Running {
 			continue
+		}
+
+		// Handle job assignment
+		if job.AssignedTo != "" {
+			if alivePods[job.AssignedTo] {
+				continue
+			}
+			// If assigned to a dead pod, unassign it first
+			oldPodID := job.AssignedTo
+			job.AssignedTo = ""
+			job.Status = command.Scheduled
+			if err := job.StoreInRedis(ctx, s.redisClient.GetClient()); err != nil {
+				continue
+			}
+			s.logger.Info("Unassigned job from dead pod", "job_id", job.ID, "pod_id", oldPodID)
 		}
 
 		// Update job with pod assignment
@@ -227,7 +225,6 @@ func (s *Scheduler) AssignJobs(ctx context.Context, pods []string) error {
 
 		// Store updated job in Redis
 		if err := job.StoreInRedis(ctx, s.redisClient.GetClient()); err != nil {
-			s.logger.Error("Failed to update job assignment", "job_id", job.ID, "pod_id", podID, "error", err)
 			continue
 		}
 

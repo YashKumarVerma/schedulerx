@@ -380,6 +380,8 @@ func (pm *PodManager) CheckPodHealth(ctx context.Context) error {
 		if err := pm.assignment.AssignJobs(ctx, availablePods); err != nil {
 			pm.logger.Error("Failed to assign jobs", "error", err)
 		}
+	} else {
+		pm.logger.Info("Not the leader, skipping job assignment")
 	}
 
 	return nil
