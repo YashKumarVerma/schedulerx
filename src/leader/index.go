@@ -2,12 +2,14 @@ package leader
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/yashkumarverma/schedulerx/src/assignment"
 	"github.com/yashkumarverma/schedulerx/src/utils"
 	"github.com/yashkumarverma/schedulerx/src/utils/cache"
 )
@@ -34,19 +36,21 @@ var (
 
 // PodManager handles pod registration and presence updates
 type PodManager struct {
-	client *cache.Client
-	logger *utils.StandardLogger
-	config *utils.Config
-	info   *PodInfo
+	client     *cache.Client
+	logger     *utils.StandardLogger
+	config     *utils.Config
+	info       *PodInfo
+	assignment *assignment.Manager
 }
 
 // NewPodManager creates a new pod manager instance
 func NewPodManager(client *cache.Client, logger *utils.StandardLogger, config *utils.Config) *PodManager {
 	once.Do(func() {
 		instance = &PodManager{
-			client: client,
-			logger: logger,
-			config: config,
+			client:     client,
+			logger:     logger,
+			config:     config,
+			assignment: assignment.NewManager(client, logger, config),
 		}
 	})
 	return instance
@@ -145,7 +149,7 @@ func (pm *PodManager) startPresenceUpdates(ctx context.Context) {
 		return
 	}
 
-	ticker := time.NewTicker(1 * time.Second)
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -308,4 +312,81 @@ func IsLeader() bool {
 		return false
 	}
 	return isLeader
+}
+
+// CheckPodHealth checks the health of all pods and updates their status
+func (pm *PodManager) CheckPodHealth(ctx context.Context) error {
+	// Get all pods from Redis
+	pods, err := pm.client.GetClient().SMembers(ctx, podRegistryKey).Result()
+	if err != nil {
+		return fmt.Errorf("failed to get pods: %w", err)
+	}
+
+	// Check each pod's health
+	for _, podID := range pods {
+		// Skip checking our own pod
+		if podID == pm.info.ID {
+			continue
+		}
+
+		// Get pod details
+		podKey := fmt.Sprintf("schedulerx:pod:%s", podID)
+		podData, err := pm.client.GetClient().Get(ctx, podKey).Bytes()
+		if err != nil {
+			pm.logger.Error("Failed to get pod details", "pod_id", podID, "error", err)
+			continue
+		}
+
+		var pod PodInfo
+		if err := json.Unmarshal(podData, &pod); err != nil {
+			pm.logger.Error("Failed to unmarshal pod details", "pod_id", podID, "error", err)
+			continue
+		}
+
+		// Check if pod is alive
+		if time.Since(pod.LastSeen) > podTTL {
+			pm.logger.Info("Pod is dead, removing from set", "pod_id", podID)
+
+			// Remove pod from set
+			if err := pm.client.GetClient().SRem(ctx, podRegistryKey, podID).Err(); err != nil {
+				pm.logger.Error("Failed to remove pod from set", "pod_id", podID, "error", err)
+				continue
+			}
+
+			// Delete pod details
+			if err := pm.client.GetClient().Del(ctx, podKey).Err(); err != nil {
+				pm.logger.Error("Failed to delete pod details", "pod_id", podID, "error", err)
+				continue
+			}
+
+			// Unassign all jobs from this pod
+			if err := pm.assignment.UnassignJobsFromPod(ctx, podID); err != nil {
+				pm.logger.Error("Failed to unassign jobs from pod", "pod_id", podID, "error", err)
+			}
+		}
+	}
+
+	// If we're the leader, assign jobs to available pods
+	if IsLeader() {
+		// Get current list of alive pods
+		alivePods, err := pm.client.GetClient().SMembers(ctx, podRegistryKey).Result()
+		if err != nil {
+			return fmt.Errorf("failed to get alive pods: %w", err)
+		}
+
+		// Filter out our own pod from the list
+		availablePods := make([]string, 0)
+		for _, podID := range alivePods {
+			if podID != pm.info.ID {
+				availablePods = append(availablePods, podID)
+			}
+		}
+
+		// Assign jobs to available pods
+		if err := pm.assignment.AssignJobs(ctx, availablePods); err != nil {
+			pm.logger.Error("Failed to assign jobs", "error", err)
+		}
+	}
+
+	return nil
 }

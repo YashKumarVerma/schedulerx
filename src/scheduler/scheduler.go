@@ -2,9 +2,11 @@ package scheduler
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
+	"github.com/robfig/cron/v3"
 	"github.com/yashkumarverma/schedulerx/src/command"
 	"github.com/yashkumarverma/schedulerx/src/leader"
 	"github.com/yashkumarverma/schedulerx/src/utils"
@@ -39,34 +41,80 @@ func (s *Scheduler) RegisterCommand(cmd command.Command) {
 	s.commands[cmd.ID()] = cmd
 }
 
-// ScheduleJobs creates and stores jobs for all registered commands
+// ScheduleJobs schedules the next batch of jobs
 func (s *Scheduler) ScheduleJobs(ctx context.Context) error {
 	if !leader.IsLeader() {
+		fmt.Println("Not the leader, skipping scheduling")
 		return nil
 	}
 
 	s.logger.Info("Scheduling jobs for all registered commands")
 
+	// Get current time and end of scheduling window
 	now := time.Now()
-	windowEnd := now.Add(SchedulingWindow)
+	endTime := now.Add(SchedulingWindow)
 
-	for _, cmd := range s.commands {
-		// Get the next execution times for this command within the scheduling window
-		nextTimes, err := s.getNextExecutionTimesInWindow(cmd, now, windowEnd)
+	// Get all commands from registry
+	cmdRegistry := command.NewCommandRegistry()
+	commands := cmdRegistry.GetCommands()
+
+	// For each command, find execution times in the window
+	for cmdID, cmd := range commands {
+		scheduleStr, params, err := cmd.Schedule()
 		if err != nil {
-			s.logger.Error("Failed to get next execution times for command", "command", cmd.ID(), "error", err)
+			s.logger.Error("Failed to get schedule for command", "command", cmdID, "error", err)
 			continue
 		}
 
-		// Create and store jobs for each execution time
-		for _, nextTime := range nextTimes {
-			job := command.NewJob(cmd.ID(), cmd.Parameters(), nextTime)
+		// Parse cron expression
+		parser := cron.NewParser(cron.Second | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
+		schedule, err := parser.Parse(scheduleStr)
+		if err != nil {
+			s.logger.Error("Failed to parse cron expression", "command", cmdID, "error", err)
+			continue
+		}
+
+		// Get next execution times until end of window
+		next := schedule.Next(now)
+		for next.Before(endTime) {
+			// Create job
+			job := command.NewJob(cmdID, params, next)
+
+			// Store job in Redis
 			if err := job.StoreInRedis(ctx, s.redisClient.GetClient()); err != nil {
-				s.logger.Error("Failed to store job in Redis", "job", job.ID, "error", err)
+				s.logger.Error("Failed to store job", "job_id", job.ID, "error", err)
 				continue
 			}
-			s.logger.Info("Created and stored job", "job", job.ID, "command", cmd.ID(), "scheduled_at", nextTime)
+
+			next = schedule.Next(next)
 		}
+	}
+
+	// Fetch and print top 10 upcoming jobs
+	fmt.Println("Fetching upcoming jobs")
+	jobs, err := s.redisClient.GetClient().ZRange(ctx, command.JobsSortedSetKey, 0, 9).Result()
+	fmt.Println("Jobs fetched", jobs)
+	if err != nil {
+		s.logger.Error("Failed to fetch upcoming jobs", "error", err)
+		return nil
+	}
+
+	fmt.Println("\nTop 10 Upcoming Jobs:")
+	fmt.Println("--------------------")
+	for _, jobID := range jobs {
+		jobKey := fmt.Sprintf(command.JobDetailsKey, jobID)
+		jobData, err := s.redisClient.GetClient().Get(ctx, jobKey).Bytes()
+		if err != nil {
+			continue
+		}
+
+		var job command.Job
+		if err := json.Unmarshal(jobData, &job); err != nil {
+			continue
+		}
+
+		fmt.Printf("Job ID: %s\nCommand: %s\nScheduled: %s\nStatus: %s\nAssignedTo: %s\n--------------------\n",
+			job.ID, job.CommandID, job.ScheduledAt.Format(time.RFC3339), job.Status, job.AssignedTo)
 	}
 
 	return nil
@@ -131,4 +179,98 @@ func (s *Scheduler) CancelTask(taskID string) error {
 func (s *Scheduler) ListTasks() ([]string, error) {
 	// TODO: Implement task listing
 	return nil, nil
+}
+
+// AssignJobs assigns unassigned jobs to available pods in a round-robin fashion
+func (s *Scheduler) AssignJobs(ctx context.Context, pods []string) error {
+	if len(pods) == 0 {
+		return fmt.Errorf("no pods available for job assignment")
+	}
+
+	// Get the number of jobs to assign from config
+	jobCount := s.config.NextJobCount
+	if jobCount <= 0 {
+		jobCount = 3 // Default value if not set
+	}
+
+	// Get unassigned jobs from Redis sorted set
+	jobs, err := s.redisClient.GetClient().ZRange(ctx, command.JobsSortedSetKey, 0, int64(jobCount)-1).Result()
+	if err != nil {
+		return fmt.Errorf("failed to fetch jobs: %w", err)
+	}
+
+	// Round-robin assignment
+	for i, jobID := range jobs {
+		podIndex := i % len(pods)
+		podID := pods[podIndex]
+
+		// Get job details
+		jobKey := fmt.Sprintf(command.JobDetailsKey, jobID)
+		jobData, err := s.redisClient.GetClient().Get(ctx, jobKey).Bytes()
+		if err != nil {
+			continue
+		}
+
+		var job command.Job
+		if err := json.Unmarshal(jobData, &job); err != nil {
+			continue
+		}
+
+		// Skip if job is already assigned or running
+		if job.AssignedTo != "" || job.Status == command.Running {
+			continue
+		}
+
+		// Update job with pod assignment
+		job.AssignedTo = podID
+		job.Status = command.Assigned
+
+		// Store updated job in Redis
+		if err := job.StoreInRedis(ctx, s.redisClient.GetClient()); err != nil {
+			s.logger.Error("Failed to update job assignment", "job_id", job.ID, "pod_id", podID, "error", err)
+			continue
+		}
+
+		s.logger.Info("Assigned job to pod", "job_id", job.ID, "pod_id", podID)
+	}
+
+	return nil
+}
+
+// UnassignJobsFromPod marks all jobs assigned to a specific pod as unassigned
+func (s *Scheduler) UnassignJobsFromPod(ctx context.Context, podID string) error {
+	// Get all jobs from Redis
+	jobs, err := s.redisClient.GetClient().ZRange(ctx, command.JobsSortedSetKey, 0, -1).Result()
+	if err != nil {
+		return fmt.Errorf("failed to fetch jobs: %w", err)
+	}
+
+	for _, jobID := range jobs {
+		jobKey := fmt.Sprintf(command.JobDetailsKey, jobID)
+		jobData, err := s.redisClient.GetClient().Get(ctx, jobKey).Bytes()
+		if err != nil {
+			continue
+		}
+
+		var job command.Job
+		if err := json.Unmarshal(jobData, &job); err != nil {
+			continue
+		}
+
+		// Only unassign jobs that are assigned to this pod and not running
+		if job.AssignedTo == podID && job.Status != command.Running {
+			job.AssignedTo = ""
+			job.Status = command.Scheduled
+
+			// Store updated job in Redis
+			if err := job.StoreInRedis(ctx, s.redisClient.GetClient()); err != nil {
+				s.logger.Error("Failed to unassign job", "job_id", job.ID, "pod_id", podID, "error", err)
+				continue
+			}
+
+			s.logger.Info("Unassigned job from pod", "job_id", job.ID, "pod_id", podID)
+		}
+	}
+
+	return nil
 }

@@ -14,6 +14,7 @@ type JobStatus string
 
 const (
 	Scheduled JobStatus = "scheduled"
+	Assigned  JobStatus = "assigned"
 	Running   JobStatus = "running"
 	Failed    JobStatus = "failed"
 	Success   JobStatus = "success"
@@ -35,6 +36,7 @@ type Job struct {
 	StartedAt   *time.Time // When the job actually started
 	FinishedAt  *time.Time // When the job finished
 	Error       string     // Error message if job failed
+	AssignedTo  string     // ID of the pod assigned to run this job
 }
 
 // NewJob creates a new job with a unique ID based on command ID and scheduled time
@@ -143,6 +145,10 @@ func (j *Job) Duration() *time.Duration {
 
 // String returns a string representation of the job
 func (j *Job) String() string {
-	return fmt.Sprintf("Job[%s] - Command: %s, Status: %s, Scheduled: %s",
-		j.ID, j.CommandID, j.Status, j.ScheduledAt.Format(time.RFC3339))
+	assignedTo := "unassigned"
+	if j.AssignedTo != "" {
+		assignedTo = j.AssignedTo
+	}
+	return fmt.Sprintf("Job[%s] - Command: %s, Status: %s, Scheduled: %s, AssignedTo: %s",
+		j.ID, j.CommandID, j.Status, j.ScheduledAt.Format(time.RFC3339), assignedTo)
 }
