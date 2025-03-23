@@ -155,26 +155,41 @@ func (s *Scheduler) ExecuteAssignedJobs(ctx context.Context) error {
 	}
 
 	for _, jobID := range jobs {
+		// Try to acquire lock for this job
+		lockKey := fmt.Sprintf("schedulerx:job_lock:%s", jobID)
+		acquired, err := s.redisClient.GetClient().SetNX(ctx, lockKey, currentPodID, 10*time.Minute).Result()
+		if err != nil {
+			s.logger.Error("Failed to acquire job lock", "job_id", jobID, "error", err)
+			continue
+		}
+		if !acquired {
+			continue // Another pod is already processing this job
+		}
+
 		// Get job details
 		jobKey := fmt.Sprintf(command.JobDetailsKey, jobID)
 		jobData, err := s.redisClient.GetClient().Get(ctx, jobKey).Bytes()
 		if err != nil {
+			s.redisClient.GetClient().Del(ctx, lockKey) // Release lock if job not found
 			continue
 		}
 
 		var job command.Job
 		if err := json.Unmarshal(jobData, &job); err != nil {
+			s.redisClient.GetClient().Del(ctx, lockKey) // Release lock if job data is invalid
 			continue
 		}
 
 		// Skip if job is not assigned to current pod or is already running/completed
 		if job.AssignedTo != currentPodID || job.Status == command.Running || job.Status == command.Success {
+			s.redisClient.GetClient().Del(ctx, lockKey) // Release lock if job shouldn't be processed
 			continue
 		}
 
 		// Mark job as running
 		job.Status = command.Running
 		if err := job.StoreInRedis(ctx, s.redisClient.GetClient()); err != nil {
+			s.redisClient.GetClient().Del(ctx, lockKey) // Release lock if update fails
 			continue
 		}
 
@@ -186,10 +201,14 @@ func (s *Scheduler) ExecuteAssignedJobs(ctx context.Context) error {
 		// Mark job as completed
 		job.Status = command.Success
 		if err := job.StoreInRedis(ctx, s.redisClient.GetClient()); err != nil {
+			s.redisClient.GetClient().Del(ctx, lockKey) // Release lock if update fails
 			continue
 		}
 
 		s.logger.Info("Completed job execution", "job_id", job.ID)
+
+		// Release the lock after successful completion
+		s.redisClient.GetClient().Del(ctx, lockKey)
 	}
 
 	return nil
