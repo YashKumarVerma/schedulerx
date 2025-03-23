@@ -124,6 +124,74 @@ func (s *Scheduler) ScheduleJobs(ctx context.Context) error {
 		}
 	}()
 
+	// Start job execution routine
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := s.ExecuteAssignedJobs(ctx); err != nil {
+					s.logger.Error("Failed to execute assigned jobs", "error", err)
+				}
+			}
+		}
+	}()
+
+	return nil
+}
+
+// ExecuteAssignedJobs executes jobs assigned to the current pod
+func (s *Scheduler) ExecuteAssignedJobs(ctx context.Context) error {
+	currentPodID := leader.GetLeader()
+
+	// Get all jobs from Redis
+	jobs, err := s.redisClient.GetClient().ZRange(ctx, command.JobsSortedSetKey, 0, -1).Result()
+	if err != nil {
+		return fmt.Errorf("failed to fetch jobs: %w", err)
+	}
+
+	for _, jobID := range jobs {
+		// Get job details
+		jobKey := fmt.Sprintf(command.JobDetailsKey, jobID)
+		jobData, err := s.redisClient.GetClient().Get(ctx, jobKey).Bytes()
+		if err != nil {
+			continue
+		}
+
+		var job command.Job
+		if err := json.Unmarshal(jobData, &job); err != nil {
+			continue
+		}
+
+		// Skip if job is not assigned to current pod or is already running/completed
+		if job.AssignedTo != currentPodID || job.Status == command.Running || job.Status == command.Success {
+			continue
+		}
+
+		// Mark job as running
+		job.Status = command.Running
+		if err := job.StoreInRedis(ctx, s.redisClient.GetClient()); err != nil {
+			continue
+		}
+
+		s.logger.Info("Starting job execution", "job_id", job.ID)
+
+		// Simulate job execution with sleep
+		time.Sleep(5 * time.Second)
+
+		// Mark job as completed
+		job.Status = command.Success
+		if err := job.StoreInRedis(ctx, s.redisClient.GetClient()); err != nil {
+			continue
+		}
+
+		s.logger.Info("Completed job execution", "job_id", job.ID)
+	}
+
 	return nil
 }
 
