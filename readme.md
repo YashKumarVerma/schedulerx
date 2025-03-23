@@ -1,52 +1,40 @@
 # Schedulerx 
 > The objective of this project is to implement a job scheduler that will run various tasks (commands) based on their cron schedules. The scheduler must be scalable and function correctly in a multi-pod environment, ensuring that each scheduled command runs exactly once at the scheduled time, even if multiple servers are executing the scheduler service.
 
-
-### Interfaces and Components:
-
-1. **Command Interface**:
-
-   - `Command` interface represents a unit of work that the `schedulerx` package will schedule.
-   - Each `Command` should have a unique identifier.
-   - The `Command` interface will allow users of the scheduler to register different types of commands that can be scheduled for execution.
-
-   **Example**:
-
-   ```pseudo
-   interface Command {
-       string ID();           // Unique ID of the command
-       error Execute(params []string);   // Method to execute the command
-   }
-   ```
-
-2. **ScheduleFetcher Interface**:
-
-   - Define a `ScheduleFetcher` interface responsible for retrieving the latest schedule for a registered `Command`.
-   - The schedule will follow cron format.
-   - The `ScheduleFetcher` should also provide parameters that will be passed to the Command while executing it.
-
-   **Example**:
-
-   ```pseudo
-   interface ScheduleFetcher {
-       (string, []string, error) FetchSchedule(string commandID);  // Fetches the cron schedule and params for the given command
-   }
-   ```
+## Overview
+- Command : something that has to be run
+- Job : execution unit of a command. For a command to run, a job needs to created and executed.
+- Config: loaded from `utils/config.go` `struct::Config`
+- All supported commands are added in `registerCommands`. All supported commands are declared in `command/command.go`
 
 
-### Functionality:
+## Multi Pod Support
+- By design, each binary is capable of being a leader or a follower.
+- When binaries come alive, they generate a ID, or get a pre-defined ID from config and register themselves.
+- Post registration, the first pod to register is selected as leader.
+- When other pods come up, since their registration timestamp is after the leader's timestamp, they identify themselves as follower.
+- ![leader election](./media/leader-election.png)
 
-- The job of the scheduler is to:
-  1. Periodically fetch the latest schedules from the `ScheduleFetcher` for the registered commands.
-  2. Execute the commands with the correct parameters at the specified cron times.
-  3. Ensure commands run exactly once at the scheduled time, even in a multi-pod environment (i.e., when the scheduler service is running on multiple servers).
-  4. The scheduler should be able to return a list of Jobs (A job is a single execution of a Command). Every job should have a unique id along with a status (running, scheduled, failed). For every Command registered in the scheduler, it should always have the next 2 instances of 'Job' scheduled. i.e., for every command, the scheduler should be able to list down all the executions (i.e., Jobs) that have completed and the next 2 scheduled Jobs.
-  5. You can use any library to parse the crontab.
-  6. For now, implement a basic version of ScheduleFetcher and inject it into the scheduler.
 
-### Expected Deliverables:
+## Flow
+- Commands have schedules defined in cron format.
+- Based on command schedules, jobs are created (and sync'd to redis)
+- These jobs are assigned by leader to alive pods.
+- Alive pods pick jobs that are assigned to them, and execute them.
+- For sake of design, the commands aren't actually run but a time.sleep is added to simulate it.
+- At a given time, only K jobs are scheduled per scheduler, so it knows the next K jobs it has to run. This also helps avoid agressive reassignment if pods die.
 
-- Define all necessary models, structs, and services to make the scheduler package work, including but not limited to:
-  - Command registration
-  - Schedule fetching and execution logic
-  - Handling multi-pod environments for safe execution
+
+## Common FAQ
+- Where is data stored: on redis, being transient in nature. Can be used with AOF mode to persist if required.
+- Can duplicate jobs be scheduled?
+  - Each job has an ID, created by combination of command and timestamp when its supposed to run based on CRON.
+  - This id is stored in sorted set. Field is job id, and score is the timestamp when its supposed to be run.
+  - So when job is attempted to be inserted again, it doesn't impact the expected flow of operations.
+- Are all jobs assigned by leader?
+  - No, leader assigns only K jobs based on the config.
+- How is exactly once execution guarenteed?
+  - Two checks are put in place.
+  - One is a pod only executes jobs which are assigned against its id. So PodA has no interaction with PodB's jobs.
+  - The pod assignment is a property of the Job, so at one time there can only be 1 pod assigned.
+  - In addition to this, due to any bug in scheduler logic, if two leaders coexist and try to assign same job to different pods one after the other (dirty write problem) and those pods pick the jobs to be processed, the execution engine takes a lock on job id before executing. If the lock cannot be obtained, the job is not executed.
