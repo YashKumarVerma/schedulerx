@@ -2,7 +2,6 @@ package leader
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"sort"
 	"sync"
@@ -17,16 +16,17 @@ import (
 const (
 	// Redis key for storing pod information
 	podRegistryKey = "schedulerx:pods"
-	// TTL for pod presence (2 seconds to allow for network delays)
-	podTTL = 2 * time.Second
+
+	// TTL for pod presence. if not heard for 5 minutes, assume pod to be dead
+	podTTL = 5 * time.Second
 )
 
-// PodInfo represents information about a running pod
 type PodInfo struct {
 	ID        string    `json:"id"`
 	StartTime time.Time `json:"start_time"`
 	LastSeen  time.Time `json:"last_seen"`
 	Status    string    `json:"status"`
+	IsLeader  bool      `json:"is_leader""`
 }
 
 var (
@@ -58,30 +58,26 @@ func NewPodManager(client *cache.Client, logger *utils.StandardLogger, config *u
 
 // Initialize sets up the pod with a unique ID and starts presence updates
 func (pm *PodManager) Initialize(ctx context.Context) error {
-	if pm.client == nil || pm.logger == nil || pm.config == nil {
-		return fmt.Errorf("pod manager not properly initialized: missing required dependencies")
-	}
-
-	// Get pod ID from config or generate new one
+	// get or create and ID for the current pod
 	podID := pm.config.PodID
 	if podID == "" {
 		podID = uuid.New().String()
 	}
 
-	// Initialize pod info
 	pm.info = &PodInfo{
 		ID:        podID,
 		StartTime: time.Now(),
 		LastSeen:  time.Now(),
 		Status:    "active",
+		IsLeader:  false,
 	}
+	fmt.Printf("Current Pod ID: %s", pm.info.ID)
 
-	// Register pod in Redis
 	if err := pm.registerPod(ctx); err != nil {
 		return fmt.Errorf("failed to register pod: %w", err)
 	}
 
-	// Start presence update routine
+	// start pod heartbeat
 	go pm.startPresenceUpdates(ctx)
 
 	pm.logger.Info("Pod manager initialized", "pod_id", podID)
@@ -272,8 +268,21 @@ func (pm *PodManager) GetLeader(ctx context.Context) (string, error) {
 		return podSlice[i].startTime.Before(podSlice[j].startTime)
 	})
 
-	// Return the ID of the pod with earliest start time
-	return podSlice[0].id, nil
+	// Get the leader ID
+	leaderID := podSlice[0].id
+
+	// Update IsLeader status for all pods
+	for id, info := range pods {
+		info.IsLeader = (id == leaderID)
+		pods[id] = info
+	}
+
+	// Store updated pods with leader status
+	if err := pm.client.SetJSONWithExpiry(ctx, podRegistryKey, pods, 24*time.Hour); err != nil {
+		return "", fmt.Errorf("failed to store updated pods: %w", err)
+	}
+
+	return leaderID, nil
 }
 
 // IsLeader checks if the current pod is the leader
@@ -282,12 +291,19 @@ func (pm *PodManager) IsLeader(ctx context.Context) (bool, error) {
 		return false, fmt.Errorf("pod info not initialized")
 	}
 
-	leaderID, err := pm.GetLeader(ctx)
+	// Get pods to check leader status
+	pods, err := pm.getPods(ctx)
 	if err != nil {
 		return false, err
 	}
 
-	return leaderID == pm.info.ID, nil
+	// Get current pod info
+	podInfo, exists := pods[pm.info.ID]
+	if !exists {
+		return false, fmt.Errorf("pod not found in registry")
+	}
+
+	return podInfo.IsLeader, nil
 }
 
 // GetLeader returns the ID of the current leader pod (global function)
@@ -305,10 +321,12 @@ func GetLeader() string {
 // IsLeader checks if the current pod is the leader (global function)
 func IsLeader() bool {
 	if instance == nil {
+		instance.logger.Error("Pod manager instance is nil")
 		return false
 	}
 	isLeader, err := instance.IsLeader(context.Background())
 	if err != nil {
+		instance.logger.Error("Failed to check leader status", "error", err)
 		return false
 	}
 	return isLeader
@@ -317,29 +335,15 @@ func IsLeader() bool {
 // CheckPodHealth checks the health of all pods and updates their status
 func (pm *PodManager) CheckPodHealth(ctx context.Context) error {
 	// Get all pods from Redis
-	pods, err := pm.client.GetClient().SMembers(ctx, podRegistryKey).Result()
+	pods, err := pm.getPods(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get pods: %w", err)
 	}
 
 	// Check each pod's health
-	for _, podID := range pods {
+	for podID, pod := range pods {
 		// Skip checking our own pod
 		if podID == pm.info.ID {
-			continue
-		}
-
-		// Get pod details
-		podKey := fmt.Sprintf("schedulerx:pod:%s", podID)
-		podData, err := pm.client.GetClient().Get(ctx, podKey).Bytes()
-		if err != nil {
-			pm.logger.Error("Failed to get pod details", "pod_id", podID, "error", err)
-			continue
-		}
-
-		var pod PodInfo
-		if err := json.Unmarshal(podData, &pod); err != nil {
-			pm.logger.Error("Failed to unmarshal pod details", "pod_id", podID, "error", err)
 			continue
 		}
 
@@ -347,17 +351,8 @@ func (pm *PodManager) CheckPodHealth(ctx context.Context) error {
 		if time.Since(pod.LastSeen) > podTTL {
 			pm.logger.Info("Pod is dead, removing from set", "pod_id", podID)
 
-			// Remove pod from set
-			if err := pm.client.GetClient().SRem(ctx, podRegistryKey, podID).Err(); err != nil {
-				pm.logger.Error("Failed to remove pod from set", "pod_id", podID, "error", err)
-				continue
-			}
-
-			// Delete pod details
-			if err := pm.client.GetClient().Del(ctx, podKey).Err(); err != nil {
-				pm.logger.Error("Failed to delete pod details", "pod_id", podID, "error", err)
-				continue
-			}
+			// Remove pod from map
+			delete(pods, podID)
 
 			// Unassign all jobs from this pod
 			if err := pm.assignment.UnassignJobsFromPod(ctx, podID); err != nil {
@@ -366,17 +361,16 @@ func (pm *PodManager) CheckPodHealth(ctx context.Context) error {
 		}
 	}
 
+	// Store updated pods
+	if err := pm.client.SetJSONWithExpiry(ctx, podRegistryKey, pods, 24*time.Hour); err != nil {
+		return fmt.Errorf("failed to store updated pods: %w", err)
+	}
+
 	// If we're the leader, assign jobs to available pods
 	if IsLeader() {
-		// Get current list of alive pods
-		alivePods, err := pm.client.GetClient().SMembers(ctx, podRegistryKey).Result()
-		if err != nil {
-			return fmt.Errorf("failed to get alive pods: %w", err)
-		}
-
 		// Filter out our own pod from the list
 		availablePods := make([]string, 0)
-		for _, podID := range alivePods {
+		for podID := range pods {
 			if podID != pm.info.ID {
 				availablePods = append(availablePods, podID)
 			}

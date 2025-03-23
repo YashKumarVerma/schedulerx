@@ -25,7 +25,6 @@ type CommandRegistry struct {
 	commands map[string]Command
 }
 
-// NewCommandRegistry creates a new command registry
 func NewCommandRegistry() *CommandRegistry {
 	registry := &CommandRegistry{
 		commands: make(map[string]Command),
@@ -70,7 +69,7 @@ func (r *CommandRegistry) GetCommand(id string) (Command, bool) {
 	return cmd, exists
 }
 
-// GetCommandDescriptions returns a map of command IDs to their descriptions
+// GetCommandDescriptions used to log which commands are supported
 func (r *CommandRegistry) GetCommandDescriptions() map[string]string {
 	descriptions := make(map[string]string)
 	for id, cmd := range r.commands {

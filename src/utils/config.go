@@ -19,19 +19,18 @@ type Config struct {
 
 var appConfig *Config
 
-// GetConfig creates a new Config struct.
 func GetConfig(ctx context.Context) *Config {
 	if appConfig != nil {
 		return appConfig
-	} else {
-		err := godotenv.Load(".env")
-		if err != nil {
-			GetAppLogger(ctx).Warnf("Unable to load .env file. Continuing without loading it...")
-		}
-		appConfig = &Config{}
-		if err = env.Parse(appConfig); err != nil {
-			panic(err)
-		}
-		return appConfig
 	}
+
+	err := godotenv.Load(".env")
+	if err != nil {
+		GetAppLogger(ctx).Warnf("Unable to load .env file. Continuing without loading it...")
+	}
+	appConfig = &Config{}
+	if err = env.Parse(appConfig); err != nil {
+		panic(err)
+	}
+	return appConfig
 }

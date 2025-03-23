@@ -16,32 +16,24 @@ import (
 )
 
 func main() {
-	// Create a context that can be cancelled
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Initialize logger
 	logger := utils.NewLogger()
-
-	// Load configuration
 	config := utils.GetConfig(ctx)
 
-	// Create Redis client
 	redisClient, err := cache.NewClient(ctx, config)
 	if err != nil {
 		logger.Fatal("Failed to create Redis client", err)
 	}
 
-	// Create command registry
 	cmdRegistry := command.NewCommandRegistry()
 
-	// Display supported commands
-	fmt.Println("\nSupported Linux Commands:")
-	fmt.Println("------------------------")
+	// only hardcoded tasks supported now
+	fmt.Println("\nSupported Commands:")
 	for cmd, desc := range cmdRegistry.GetCommandDescriptions() {
 		fmt.Printf("%-15s - %s\n", cmd, desc)
 	}
-	fmt.Println("------------------------\n")
 
 	// Initialize pod manager
 	podManager := leader.NewPodManager(redisClient, logger, config)

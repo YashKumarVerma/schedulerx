@@ -92,8 +92,8 @@ func (s *Scheduler) ScheduleJobs(ctx context.Context) error {
 
 	// Fetch and print top 10 upcoming jobs
 	fmt.Println("Fetching upcoming jobs")
-	jobs, err := s.redisClient.GetClient().ZRange(ctx, command.JobsSortedSetKey, 0, 9).Result()
-	fmt.Println("Jobs fetched", jobs)
+	jobs, err := s.redisClient.GetClient().ZRange(ctx, command.JobsSortedSetKey, 0, -1).Result()
+	fmt.Println("Total Job Count", len(jobs))
 	if err != nil {
 		s.logger.Error("Failed to fetch upcoming jobs", "error", err)
 		return nil
